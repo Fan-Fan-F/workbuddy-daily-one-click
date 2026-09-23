@@ -1,0 +1,13 @@
+WorkBuddy-Daily/
+wb_refresh_tokens.json
+WORKBUDDY_ACCESS_TOKEN.txt
+wb_login_result.json
+token.txt
+*.info
+.env
+.env.*
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.zip
