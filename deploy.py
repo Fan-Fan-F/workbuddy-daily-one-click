@@ -1323,12 +1323,11 @@ def store_to_secret_lines(store):
 def merge_account_into_store(store, phone, at, rt):
     """
     把本机账号并入令牌库。返回 (新库, 状态)。
-    状态取值：'new' 新增 / 'updated' 已更新 / 'kept' 仓库里的更新、保持不动。
+    状态：'new' 新增 / 'updated' 已更新 / 'same' 完全一致 / 'kept' 保留仓库状态。
 
-    护栏：同一个手机号已存在时，比较两边令牌的 exp ——
-    仓库里的令牌由 Actions 持续轮换，通常比本机登录态文件更新。
-    直接用本机覆盖会造成令牌回退（旧 RT 已作废 → 下次 401），
-    所以这里只在「本机更新」时才覆盖。
+    已有非空 RT 与本机不同时默认保留，显式换凭据仍走 --force-secret。
+    相同 RT 只允许补入可解析 exp 的缺失 AT，或替换为 exp 明确更晚的 AT；
+    RT 的过期时间不能用来证明 AT 更新，更不能证明不同 RT 仍被服务端接受。
     """
     store = dict(store or {})
     key = phone or "account"
@@ -1343,19 +1342,26 @@ def merge_account_into_store(store, phone, at, rt):
         if (old_item.get("refresh_token") == rt
                 and old_item.get("access_token") == at):
             return store, "same"
-        old_exp = max([e for e in (jwt_exp(old_item.get("access_token") or ""),
-                                  jwt_exp(old_item.get("refresh_token") or "")) if e] or [0])
-        new_exp = max([e for e in (jwt_exp(at), jwt_exp(rt)) if e] or [0])
-        # 仓库里的 exp 已知、且「本机更新」这件事证明不了时，一律保持仓库的。
-        # 否则一个解析不出 exp 的令牌会静默把仓库里有效的令牌覆盖掉。
-        if old_exp and (not new_exp or old_exp > new_exp):
+        old_rt = old_item.get("refresh_token") or ""
+        old_at = old_item.get("access_token") or ""
+        if old_rt and old_rt != rt:
             return store, "kept"
+        if old_rt:
+            old_exp, new_exp = jwt_exp(old_at), jwt_exp(at)
+            if new_exp is None or (old_at and (old_exp is None or new_exp <= old_exp)):
+                return store, "kept"
+        elif not rt:
+            return store, "kept"
+        item = dict(old_item)
+        item["refresh_token"] = rt
+        if old_rt or not old_at:
+            item["access_token"] = at
+        item["updated"] = time.strftime("%Y-%m-%d %H:%M")
+        store[key] = item
+        return store, status
 
-    store[key] = {
-        "refresh_token": rt,
-        "access_token": at,
-        "updated": time.strftime("%Y-%m-%d %H:%M"),
-    }
+    store[key] = {"refresh_token": rt, "access_token": at,
+                  "updated": time.strftime("%Y-%m-%d %H:%M")}
     return store, status
 
 
@@ -1370,20 +1376,50 @@ def store_account_list(store):
 def commit_store(workdir, store, message):
     """
     把令牌库写进文件、提交并推送。
-    注意：必须由本函数负责落盘 —— 早期版本只做 git add，
-    结果合并后的内容根本没写进文件，静默变成「内容无变化」。
-    wb_refresh_tokens.json 被 .gitignore 挡住，必须 git add -f。
+    完整候选先写入同目录、同步并关闭；拒绝无关暂存后才替换原库。
+    Git 失败必须中止，不能返回 False（调用方在 False 后仍会更新 Secret）。
+    本地替换后的 Git 错误不表示文件已回滚；只提交本函数的状态文件。
     """
     path = os.path.join(workdir, "wb_refresh_tokens.json")
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        json.dump(store, fh, ensure_ascii=False, indent=1)
-    git(["add", "-f", "wb_refresh_tokens.json"], workdir, check=False)
-    q = git(["diff", "--cached", "--quiet"], workdir, check=False)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n",
+                                         prefix=".wb-refresh-", suffix=".tmp",
+                                         dir=workdir, delete=False) as fh:
+            temporary = fh.name
+            json.dump(store, fh, ensure_ascii=False, indent=1)
+            fh.flush()
+            os.fsync(fh.fileno())
+        staged = git(["diff", "--cached", "--name-only", "-z"], workdir, check=False)
+        if staged.returncode != 0:
+            die("无法检查 Git 暂存区，已停止；原令牌库与暂存区未改动。")
+        if any(name != "wb_refresh_tokens.json" for name in (staged.stdout or "").split("\0") if name):
+            die("存在其他已暂存改动，已停止；原令牌库与暂存区未改动。请先处理这些改动后重试。")
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+    added = git(["add", "-f", "--", "wb_refresh_tokens.json"], workdir, check=False)
+    if added.returncode != 0:
+        die(f"令牌库已保存在本地，但 git add 失败（退出码 {added.returncode}）；未提交或推送，后续 Secret 更新已停止。")
+    q = git(["diff", "--cached", "--quiet", "--", "wb_refresh_tokens.json"], workdir, check=False)
     if q.returncode == 0:
         return False
-    git(["-c", "user.name=WorkBuddy Deployer",
-         "-c", "user.email=noreply@local", "commit", "-m", message], workdir)
-    push(workdir)
+    if q.returncode != 1:
+        die(f"令牌库已保存在本地，但 git diff 失败（退出码 {q.returncode}）；未提交或推送，后续 Secret 更新已停止。")
+    committed = git(["-c", "user.name=WorkBuddy Deployer",
+                     "-c", "user.email=noreply@local", "commit", "--only", "-m", message,
+                     "--", "wb_refresh_tokens.json"], workdir, check=False)
+    if committed.returncode != 0:
+        die(f"令牌库已保存在本地，但提交失败（退出码 {committed.returncode}）；未执行推送，后续 Secret 更新已停止。")
+    try:
+        push(workdir)
+    except (Exception, SystemExit):
+        warn("令牌库已保存在本地并提交，但推送未确认成功；后续 Secret 更新已停止，不能视为全部回滚。")
+        raise
     return True
 
 
@@ -1691,7 +1727,7 @@ def cmd_deploy(args, full_name, workdir, mode="默认"):
             info(f"{mask_phone(phone)} 的令牌与仓库里完全一致，无需改动")
             ok(f"当前共 {len(merged)} 个账号：{', '.join(store_account_list(merged))}")
         elif status == "kept":
-            warn(f"仓库里 {mask_phone(phone)} 的令牌比本机新，保持不动（避免令牌回退）")
+            warn(f"无法确认 {mask_phone(phone)} 的本机凭据可安全覆盖，保留仓库状态；确需换凭据请使用现有 --force-secret 流程")
             ok(f"当前共 {len(merged)} 个账号：{', '.join(store_account_list(merged))}")
         else:
             msg = ("feat: 追加账号 %s" % mask_phone(phone)) if status == "new"                 else ("chore: 更新账号 %s 的令牌" % mask_phone(phone))
